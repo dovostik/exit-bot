@@ -1,8 +1,8 @@
 import requests
 import time
 import os
-import random
 import json
+import yfinance as yf
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -19,7 +19,7 @@ CHAT_FILE = "chat.json"
 positions = {}
 chat_id_global = None
 
-print("Exit Bot jalan...")
+print("Exit Bot jalan dengan harga real...")
 
 
 def load_positions():
@@ -64,7 +64,8 @@ def send_message(chat_id, text):
         json={
             "chat_id": chat_id,
             "text": text
-        }
+        },
+        timeout=30
     )
 
 
@@ -93,9 +94,108 @@ def format_position(symbol, pos):
     return "\n".join(lines)
 
 
-def simulate_price(entry):
-    change = random.uniform(-1.5, 1.5)
-    return entry + change
+def yahoo_symbol(symbol):
+    symbol = symbol.upper().strip()
+    if symbol.endswith(".JK"):
+        return symbol
+    return f"{symbol}.JK"
+
+
+def get_real_price(symbol):
+    ys = yahoo_symbol(symbol)
+
+    try:
+        ticker = yf.Ticker(ys)
+
+        # coba ambil data intraday 15m dulu
+        hist = ticker.history(period="1d", interval="15m")
+
+        if hist is not None and not hist.empty:
+            last_close = float(hist["Close"].dropna().iloc[-1])
+            return round(last_close, 2)
+
+        # fallback ke daily
+        hist = ticker.history(period="5d", interval="1d")
+        if hist is not None and not hist.empty:
+            last_close = float(hist["Close"].dropna().iloc[-1])
+            return round(last_close, 2)
+
+    except Exception as e:
+        print("Yahoo error:", symbol, e)
+
+    return None
+
+
+def analyze_position(symbol, pos):
+    entry = pos["entry"]
+    price = get_real_price(symbol)
+
+    if price is None:
+        return None, "Data harga belum tersedia."
+
+    sl = pos.get("sl")
+    tp1 = pos.get("tp1")
+    tp2 = pos.get("tp2")
+
+    pos["last_price"] = price
+
+    pnl_pct = ((price - entry) / entry) * 100
+    pos["pnl_pct"] = round(pnl_pct, 2)
+
+    if pos.get("max_profit_pct") is None:
+        pos["max_profit_pct"] = pos["pnl_pct"]
+    else:
+        pos["max_profit_pct"] = max(pos["max_profit_pct"], pos["pnl_pct"])
+
+    max_profit = pos.get("max_profit_pct", 0)
+
+    giveback_ratio = 0
+    if max_profit > 0:
+        giveback_ratio = (max_profit - pnl_pct) / max_profit
+        if giveback_ratio < 0:
+            giveback_ratio = 0
+
+    pos["giveback_ratio"] = round(giveback_ratio, 2)
+
+    signal = ""
+    action = ""
+
+    if sl is not None and price <= sl:
+        signal = "❌ CUT FAST"
+        action = "Harga sudah di bawah/menyentuh SL."
+    elif tp2 is not None and price >= tp2:
+        signal = "🏁 TAKE PROFIT FULL"
+        action = "Harga sudah mencapai TP2."
+    elif tp1 is not None and price >= tp1:
+        signal = "🎯 TAKE PROFIT PARTIAL"
+        action = "Harga sudah mencapai TP1."
+    elif max_profit >= 1.0 and giveback_ratio >= 0.5:
+        signal = "🚨 FAILURE EXIT"
+        action = "Sempat profit bagus, tapi giveback sudah besar."
+    elif max_profit >= 0.8 and pnl_pct > 0:
+        signal = "🛡 PROTECT PROFIT"
+        action = "Profit ada, amankan posisi / naikkan SL."
+    elif price > entry:
+        signal = "🟢 HOLD"
+        action = "Masih di atas harga entry."
+    else:
+        signal = "⚠️ WASPADA"
+        action = "Belum aman, dekat area entry / risiko."
+
+    pos["last_signal"] = signal
+
+    message = (
+        f"{symbol}\n"
+        f"Harga sekarang: {price:.2f}\n"
+        f"Entry: {entry:.2f}\n"
+        f"PnL: {pnl_pct:+.2f}%\n"
+        f"Max Profit: {max_profit:+.2f}%\n"
+        f"Giveback: {giveback_ratio:.0%}\n\n"
+        f"{signal}\n"
+        f"{action}"
+    )
+
+    return price, message
 
 
 def monitor_positions():
@@ -107,27 +207,11 @@ def monitor_positions():
     changed = False
 
     for symbol, pos in positions.items():
-        entry = pos["entry"]
-        price = simulate_price(entry)
+        price, message = analyze_position(symbol, pos)
 
-        sl = pos.get("sl")
-        tp1 = pos.get("tp1")
-
-        pos["last_price"] = price
-
-        message = f"{symbol}\nHarga sekarang: {price:.2f}\nEntry: {entry:.2f}\n"
-
-        if sl and price <= sl:
-            signal = "❌ CUT FAST (kena SL)"
-        elif tp1 and price >= tp1:
-            signal = "🎯 TAKE PROFIT tercapai"
-        elif price > entry:
-            signal = "🟢 HOLD (masih profit)"
-        else:
-            signal = "⚠️ WASPADA (mendekati SL)"
-
-        pos["last_signal"] = signal
-        message += signal
+        if price is None:
+            send_message(chat_id_global, f"{symbol}\nData harga belum tersedia dari Yahoo Finance.")
+            continue
 
         send_message(chat_id_global, message)
         changed = True
@@ -149,7 +233,7 @@ def handle_command(chat_id, text):
     if cmd == "/start":
         send_message(
             chat_id,
-            "Exit Bot aktif.\n\n"
+            "Exit Bot aktif (harga real Yahoo).\n\n"
             "Command:\n"
             "/startpos KODE HARGA\n"
             "/setsl KODE HARGA\n"
@@ -180,7 +264,10 @@ def handle_command(chat_id, text):
             "tp2": None,
             "status": "dipantau",
             "last_price": None,
-            "last_signal": None
+            "last_signal": None,
+            "pnl_pct": None,
+            "max_profit_pct": 0,
+            "giveback_ratio": 0
         }
 
         save_positions()
@@ -253,6 +340,8 @@ def handle_command(chat_id, text):
             send_message(chat_id, f"Posisi {symbol} belum ada.")
             return
 
+        price, _ = analyze_position(symbol, positions[symbol])
+        save_positions()
         send_message(chat_id, format_position(symbol, positions[symbol]))
         return
 
@@ -311,6 +400,7 @@ while True:
 
                 handle_command(chat_id, text)
 
+        # interval monitor sementara tetap 15 detik dulu
         if time.time() - last_check > 15:
             monitor_positions()
             last_check = time.time()
