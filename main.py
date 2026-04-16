@@ -213,9 +213,8 @@ def monitor_positions():
 
         if price is None:
             continue
-
-        prev_signal = pos.get("last_signal")
-        current_signal = pos.get("last_signal")
+            
+            current_signal = pos.get("last_signal")
 
         # hanya kirim jika sinyal berubah
         if prev_signal != current_signal:
