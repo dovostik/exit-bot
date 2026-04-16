@@ -159,6 +159,7 @@ def analyze_position(symbol, pos):
 
     signal = ""
     action = ""
+    prev_signal = pos.get("last_signal")
 
     if sl is not None and price <= sl:
         signal = "❌ CUT FAST"
@@ -207,14 +208,19 @@ def monitor_positions():
     changed = False
 
     for symbol, pos in positions.items():
+        entry = pos["entry"]
         price, message = analyze_position(symbol, pos)
 
         if price is None:
-            send_message(chat_id_global, f"{symbol}\nData harga belum tersedia dari Yahoo Finance.")
             continue
 
-        send_message(chat_id_global, message)
-        changed = True
+        prev_signal = pos.get("last_signal")
+        current_signal = pos.get("last_signal")
+
+        # hanya kirim jika sinyal berubah
+        if prev_signal != current_signal:
+            send_message(chat_id_global, message)
+            changed = True
 
     if changed:
         save_positions()
@@ -400,8 +406,8 @@ while True:
 
                 handle_command(chat_id, text)
 
-        # interval monitor sementara tetap 15 detik dulu
-        if time.time() - last_check > 15:
+        # interval monitor sementara tetap 900 detik dulu
+        if time.time() - last_check > 900:
             monitor_positions()
             last_check = time.time()
 
