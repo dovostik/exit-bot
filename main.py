@@ -2,6 +2,7 @@ import requests
 import time
 import os
 import random
+import json
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
@@ -12,16 +13,60 @@ if not TOKEN:
 URL = f"https://api.telegram.org/bot{TOKEN}"
 last_update_id = 0
 
+POSITIONS_FILE = "positions.json"
+CHAT_FILE = "chat.json"
+
 positions = {}
 chat_id_global = None
 
 print("Exit Bot jalan...")
 
+
+def load_positions():
+    global positions
+    if os.path.exists(POSITIONS_FILE):
+        try:
+            with open(POSITIONS_FILE, "r") as f:
+                positions = json.load(f)
+        except:
+            positions = {}
+    else:
+        positions = {}
+
+
+def save_positions():
+    with open(POSITIONS_FILE, "w") as f:
+        json.dump(positions, f)
+
+
+def load_chat():
+    global chat_id_global
+    if os.path.exists(CHAT_FILE):
+        try:
+            with open(CHAT_FILE, "r") as f:
+                data = json.load(f)
+                chat_id_global = data.get("chat_id")
+        except:
+            chat_id_global = None
+    else:
+        chat_id_global = None
+
+
+def save_chat():
+    global chat_id_global
+    with open(CHAT_FILE, "w") as f:
+        json.dump({"chat_id": chat_id_global}, f)
+
+
 def send_message(chat_id, text):
-    requests.post(f"{URL}/sendMessage", json={
-        "chat_id": chat_id,
-        "text": text
-    })
+    requests.post(
+        f"{URL}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text
+        }
+    )
+
 
 def format_position(symbol, pos):
     lines = [
@@ -39,17 +84,27 @@ def format_position(symbol, pos):
     if pos.get("tp2") is not None:
         lines.append(f"TP2: {pos['tp2']:.2f}")
 
+    if pos.get("last_price") is not None:
+        lines.append(f"Harga terakhir: {pos['last_price']:.2f}")
+
+    if pos.get("last_signal") is not None:
+        lines.append(f"Rekomendasi: {pos['last_signal']}")
+
     return "\n".join(lines)
+
 
 def simulate_price(entry):
     change = random.uniform(-1.5, 1.5)
     return entry + change
+
 
 def monitor_positions():
     global chat_id_global
 
     if not chat_id_global:
         return
+
+    changed = False
 
     for symbol, pos in positions.items():
         entry = pos["entry"]
@@ -58,20 +113,32 @@ def monitor_positions():
         sl = pos.get("sl")
         tp1 = pos.get("tp1")
 
+        pos["last_price"] = price
+
         message = f"{symbol}\nHarga sekarang: {price:.2f}\nEntry: {entry:.2f}\n"
 
         if sl and price <= sl:
-            message += "❌ CUT FAST (kena SL)"
+            signal = "❌ CUT FAST (kena SL)"
         elif tp1 and price >= tp1:
-            message += "🎯 TAKE PROFIT tercapai"
+            signal = "🎯 TAKE PROFIT tercapai"
         elif price > entry:
-            message += "🟢 HOLD (masih profit)"
+            signal = "🟢 HOLD (masih profit)"
         else:
-            message += "⚠️ WASPADA (mendekati SL)"
+            signal = "⚠️ WASPADA (mendekati SL)"
+
+        pos["last_signal"] = signal
+        message += signal
 
         send_message(chat_id_global, message)
+        changed = True
+
+    if changed:
+        save_positions()
+
 
 def handle_command(chat_id, text):
+    global chat_id_global
+
     parts = text.strip().split()
 
     if not parts:
@@ -111,42 +178,75 @@ def handle_command(chat_id, text):
             "sl": None,
             "tp1": None,
             "tp2": None,
-            "status": "dipantau"
+            "status": "dipantau",
+            "last_price": None,
+            "last_signal": None
         }
 
+        save_positions()
         send_message(chat_id, "Posisi mulai dipantau.\n\n" + format_position(symbol, positions[symbol]))
         return
 
     if cmd == "/setsl":
+        if len(parts) < 3:
+            send_message(chat_id, "Format: /setsl BRIS 2432")
+            return
+
         symbol = parts[1].upper()
 
         if symbol not in positions:
             send_message(chat_id, f"Posisi {symbol} belum ada.")
             return
 
-        sl = float(parts[2])
+        try:
+            sl = float(parts[2])
+        except:
+            send_message(chat_id, "Harga SL tidak valid.")
+            return
+
         positions[symbol]["sl"] = sl
+        save_positions()
 
         send_message(chat_id, f"SL diatur.\n\n{format_position(symbol, positions[symbol])}")
         return
 
     if cmd == "/settp":
+        if len(parts) < 3:
+            send_message(chat_id, "Format: /settp BRIS 2480 [2510]")
+            return
+
         symbol = parts[1].upper()
 
         if symbol not in positions:
             send_message(chat_id, f"Posisi {symbol} belum ada.")
             return
 
-        tp1 = float(parts[2])
-        tp2 = float(parts[3]) if len(parts) >= 4 else None
+        try:
+            tp1 = float(parts[2])
+        except:
+            send_message(chat_id, "TP1 tidak valid.")
+            return
+
+        tp2 = None
+        if len(parts) >= 4:
+            try:
+                tp2 = float(parts[3])
+            except:
+                send_message(chat_id, "TP2 tidak valid.")
+                return
 
         positions[symbol]["tp1"] = tp1
         positions[symbol]["tp2"] = tp2
+        save_positions()
 
         send_message(chat_id, f"TP diatur.\n\n{format_position(symbol, positions[symbol])}")
         return
 
     if cmd == "/status":
+        if len(parts) < 2:
+            send_message(chat_id, "Format: /status BRIS")
+            return
+
         symbol = parts[1].upper()
 
         if symbol not in positions:
@@ -161,18 +261,23 @@ def handle_command(chat_id, text):
             send_message(chat_id, "Belum ada posisi.")
             return
 
-        text = "Posisi aktif:\n\n"
-        for s, p in positions.items():
-            text += format_position(s, p) + "\n\n"
+        text_out = "Posisi aktif:\n\n"
+        for symbol, pos in positions.items():
+            text_out += format_position(symbol, pos) + "\n\n"
 
-        send_message(chat_id, text)
+        send_message(chat_id, text_out)
         return
 
     if cmd == "/closepos":
+        if len(parts) < 2:
+            send_message(chat_id, "Format: /closepos BRIS")
+            return
+
         symbol = parts[1].upper()
 
         if symbol in positions:
             del positions[symbol]
+            save_positions()
             send_message(chat_id, f"{symbol} ditutup.")
         else:
             send_message(chat_id, f"{symbol} tidak ditemukan.")
@@ -180,13 +285,18 @@ def handle_command(chat_id, text):
 
     send_message(chat_id, "Perintah tidak dikenal.")
 
+
+load_positions()
+load_chat()
+
 last_check = time.time()
 
 while True:
     try:
         res = requests.get(
             f"{URL}/getUpdates",
-            params={"offset": last_update_id + 1}
+            params={"offset": last_update_id + 1},
+            timeout=30
         ).json()
 
         for update in res.get("result", []):
@@ -197,6 +307,7 @@ while True:
                 text = update["message"].get("text", "")
 
                 chat_id_global = chat_id
+                save_chat()
 
                 handle_command(chat_id, text)
 
